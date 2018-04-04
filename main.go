@@ -8,6 +8,9 @@ import (
 	"os"
 	"bufio"
 	"time"
+	"gopkg.in/ini.v1"
+	"os/exec"
+	"io/ioutil"
 )
 
 var Delimiter = '|'
@@ -46,20 +49,51 @@ func fatalOnErr(err error) {
 var WriteHeader = true
 
 
-func main() {
-	defer timeTrack(time.Now(), "mysql write to file")
-	db, err := sqlx.Open("mysql", "CONNECT_STRING")
+func makeConnectString(config DBConfig) string {
+	return fmt.Sprintf("%v:%v@tcp(%v)/%v", config.user, config.pass, config.host, config.dbname)
+}
+
+type DBConfig struct {
+	host string
+	user string
+	pass string
+	dbname string
+}
+
+func dumpFromMysql(config DBConfig, table string, query string) {
+	fmt.Println("dumping from mysql..")
+	defer timeTrack(time.Now(), fmt.Sprintf("CLI dump: %v", table))
+	outputFile := "dump_output.csv"
+	cmd := exec.Command(
+		"mysql",
+		fmt.Sprintf("-h%v", config.host),
+		fmt.Sprintf("-u%v", config.user),
+		fmt.Sprintf("-p%v", config.pass),
+		fmt.Sprintf("-A"),
+		fmt.Sprintf("-q"),
+		fmt.Sprintf("-e%v", query))
+	output, err := cmd.Output()
+	if err != nil {
+		log.Fatal(err)
+	}
+	ioutil.WriteFile(outputFile, []byte(output), 0666)
+}
+
+func dumpFromCursor(config DBConfig, table string, query string) {
+	fmt.Println("Dumping from cursor..")
+	connectString := makeConnectString(config)
+	defer timeTrack(time.Now(), fmt.Sprintf("Cursor Dump: %v", table))
+
+	db, err := sqlx.Open("mysql", connectString)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	table := os.Args[1]
-
-	fp, err := os.OpenFile("output.csv", os.O_CREATE | os.O_TRUNC | os.O_RDWR, 0666)
+	fp, err := os.OpenFile("cursor_dump.csv", os.O_CREATE | os.O_TRUNC | os.O_RDWR, 0666)
 	fatalOnErr(err)
 	writer := bufio.NewWriterSize(fp, 4096)
 
-	rows, err := db.Queryx(fmt.Sprintf("SELECT * FROM %v", table))
+	rows, err := db.Queryx(query)
 	fatalOnErr(err)
 
 	cols, _ := rows.Columns()
@@ -102,5 +136,32 @@ func main() {
 
 	// clear buffer
 	writer.Flush()
-	fmt.Println("Done!")
+}
+
+func main() {
+	// TODO: have this point to the real config file
+	configFile := "config.ini"
+	cfg, err := ini.Load(configFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	section := cfg.Section("mysql")
+	host := section.Key("host").String()
+	user := section.Key("user").String()
+	pass := section.Key("password").String()
+	dbname := section.Key("dbname").String()
+
+	dbconfig := DBConfig{
+		host,
+		user,
+		pass,
+		dbname,
+	}
+	table := "rtr_prod0808.uc_orders"
+	query :=fmt.Sprintf("SELECT * FROM %v", table)
+
+	dumpFromMysql(dbconfig, table, query)
+	dumpFromCursor(dbconfig, table, query)
+
 }
