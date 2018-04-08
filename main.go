@@ -1,4 +1,5 @@
 package main
+
 //TODO make this mysql package
 
 import (
@@ -20,26 +21,26 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 )
 
-
 var Delimiter = '|'
 var NewLine = '\n'
 var NullString = "NULL"
 var OutputDir = "./output"
+var TotalWorkers = 4
 
 var S3Bucket = "mybucket"
 
 type Field struct {
 	FieldName string
-	DataType string
+	DataType  string
 }
 
 type CreateStatement struct {
 	TableName string
-	Fields []Field
+	Fields    []Field
 }
 
 func makeS3Key(table Table, basefile string) string {
-	return fmt.Sprintf("tablecopy/%v/%v", table.FullName(), basefile	)
+	return fmt.Sprintf("tablecopy/%v/%v", table.FullName(), basefile)
 }
 
 func (cs *CreateStatement) toString() string {
@@ -65,8 +66,8 @@ type Table struct {
 func NewTable(fullname string) Table {
 	pieces := strings.Split(fullname, ".")
 	return Table{
-		Schema:pieces[0],
-		TableName:pieces[1],
+		Schema:    pieces[0],
+		TableName: pieces[1],
 	}
 }
 
@@ -105,8 +106,6 @@ func (t *TableSizeDB) toTableSize() *TableSize {
 		SizeMB:  sizeMb,
 	}
 }
-
-
 
 func timeTrack(start time.Time, name string) {
 	elapsed := time.Since(start)
@@ -148,9 +147,8 @@ func getMySQLTableSize(db *sqlx.DB, table Table) *TableSize {
 	return tablesize.toTableSize()
 }
 
-
 func DumpTableToFile(db *sqlx.DB, table Table, outfile string) {
-	defer timeTrack(time.Now(), fmt.Sprintf("Cursor Dump: %v", table))
+	defer timeTrack(time.Now(), fmt.Sprintf("File Dump: %v", table))
 
 	fmt.Printf("Dumping %v to %v\n", table.FullName(), outfile)
 
@@ -163,7 +161,7 @@ func DumpTableToFile(db *sqlx.DB, table Table, outfile string) {
 
 	writer := bufio.NewWriterSize(fp, 4096)
 
-	rows, err := db.Queryx(fmt.Sprintf("SELECT * FROM %v", table.FullName()))
+	rows, err := db.Queryx(fmt.Sprintf("SELECT * FROM %v LIMIT 10000", table.FullName()))
 	fatalOnErr(err)
 
 	// TODO, could also call information schema if columnTypes isnt
@@ -241,33 +239,55 @@ func uploadToS3(file string, table Table) {
 
 	result, err := uploader.Upload(&s3manager.UploadInput{
 		Bucket: aws.String(S3Bucket),
-		Key: aws.String(key),
-		Body: f,
+		Key:    aws.String(key),
+		Body:   f,
 	})
 	fatalOnErr(err)
 
 	fmt.Printf("file uploaded to, %s\n", result.Location)
 }
 
-func DumpTableLoop(db *sqlx.DB, pool chan Table) {
-	for {
-
+func asyncWorker(
+	id int,
+	db *sqlx.DB,
+	incoming <-chan Table,
+	outgoing chan<- Table) {
+	for table := range incoming {
+		outfile := path.Join(OutputDir, table.Filename(false))
+		DumpTableToFile(db, table, outfile)
+		outgoing <- table
 	}
 }
 
-func DumpTableList(db *sqlx.DB, outputDir string, tables []Table) {
-	pool := make(chan Table, 4)
+func DumpTableList(
+	db *sqlx.DB,
+	tables []Table,
+	numWorkers int) {
 
-	// start async pool loop
-	go DumpTableLoop(db, pool)
+	defer timeTrack(time.Now(), "Dump ALL tables")
 
-	for _, table := range tables {
-		outfile := path.Join(outputDir, table.Filename(false))
-		pool<- table
+	incomingTables := make(chan Table, len(tables))
+	outgoingTables := make(chan Table, len(tables))
+
+	// start async workers
+	for i := 0; i < numWorkers; i++ {
+		go asyncWorker(i, db, incomingTables, outgoingTables)
 	}
+
+	// put tables to be fetched on incoming work channel
+	numTables := len(tables)
+	for i := 0; i < numTables; i++ {
+		incomingTables <- tables[i]
+	}
+	close(incomingTables)
+
+	// collect results
+	for i := 0; i < numTables; i++ {
+		<-outgoingTables
+	}
+	close(outgoingTables)
+
 }
-
-
 
 func main() {
 	defer timeTrack(time.Now(), "Total job")
@@ -290,7 +310,8 @@ func main() {
 		dbname,
 	}
 
-	tableNames := []string {
+	tableNames := []string{
+
 	}
 
 	var tables []Table
@@ -304,8 +325,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	DumpTableList(db, OutputDir, tables)
-
+	DumpTableList(db, tables, TotalWorkers)
 
 	//uploadToS3(outputFile, table)
 
